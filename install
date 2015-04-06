@@ -1,0 +1,197 @@
+#!/System/Library/Frameworks/Ruby.framework/Versions/Current/usr/bin/ruby
+# Bootstrapping an new Mac OS X machine
+#
+# Code adopted from the Homebrew project s. https://github.com/Homebrew/install/blob/master/install
+ansible_playbook_repository = ENV["ANSIBLE_PLAYBOOK_REPOSITORY"]
+ansible_playbook            = ENV["ANSIBLE_PLAYBOOK"] || "local.yml"
+
+module Tty extend self
+  def blue; bold 34; end
+  def white; bold 39; end
+  def yellow; bold 33; end
+  def red; bold 31; end
+  def reset; escape 0; end
+  def bold n; escape "1;#{n}" end
+  def underline n; escape "4;#{n}" end
+  def escape n; "\033[#{n}m" if STDOUT.tty? end
+end
+
+class Array
+  def shell_s
+    cp = dup
+    first = cp.shift
+    cp.map{ |arg| arg.gsub " ", "\\ " }.unshift(first) * " "
+  end
+end
+
+def ohai *args
+  puts "#{Tty.blue}==>#{Tty.white} #{args.shell_s}#{Tty.reset}"
+end
+
+def warn warning
+  puts "#{Tty.yellow}Warning#{Tty.reset}: #{warning.chomp}"
+end
+
+def error error
+    puts "#{Tty.red}Error#{Tty.reset}: #{error.chomp}"
+end
+
+def system *args
+  abort "Failed during: #{args.shell_s}" unless Kernel.system(*args)
+end
+
+def sudo *args
+  ohai "/usr/bin/sudo", *args
+  system "/usr/bin/sudo", *args
+end
+
+def getc  # NOTE only tested on OS X
+  system "/bin/stty raw -echo"
+  if STDIN.respond_to?(:getbyte)
+    STDIN.getbyte
+  else
+    STDIN.getc
+  end
+ensure
+  system "/bin/stty -raw echo"
+end
+
+def wait_for_user
+  puts
+  puts "Press RETURN to continue or any other key to abort"
+  c = getc
+  # we test for \r and \n because some stuff does \r instead
+  abort unless c == 13 or c == 10
+  puts
+end
+
+def prompt question, default = nil
+  return default unless STDIN.tty?
+
+  default_string = (default.nil?) ? "" : " (#{default})"
+  print "#{question}#{default_string}: "
+
+  answer = STDIN.gets.strip
+  (answer == "") ? default : answer
+ensure
+  system "/bin/stty -raw echo"
+end
+
+module Version
+  def <=>(other)
+    split(".").map { |i| i.to_i } <=> other.split(".").map { |i| i.to_i }
+  end
+end
+
+def macos_version
+  @macos_version ||= `/usr/bin/sw_vers -productVersion`.chomp[/10\.\d+/].extend(Version)
+end
+
+def wait_until_for time
+  while time > 0 && yield
+    print "."
+    time -= 5
+    sleep 5
+  end
+end
+
+# Invalidate sudo timestamp before exiting
+at_exit { Kernel.system "/usr/bin/sudo", "-k" }
+
+
+####################################################################### script
+abort "This will only bootsrap Mac OS X machines" if /linux/i === RUBY_PLATFORM
+abort "Mac OS X too old" if macos_version < "10.9"
+abort "Don't run this as root!" if Process.uid == 0
+abort "This script requires the user #{ENV['USER']} to be an Administrator." unless `groups`.split.include? "admin"
+
+ohai "What Git repository should be pulled?"
+
+ansible_playbook_repository = prompt "Ansible Playbook Git repository", ansible_playbook_repository
+abort "No repository given by user." if ansible_playbook_repository.nil? || ansible_playbook_repository.strip == ""
+
+ansible_playbook = prompt "Ansible Playbook to run", ansible_playbook
+abort "No Playbook given by user." if ansible_playbook.nil? || ansible_playbook.strip == ""
+
+puts
+
+ohai "This script will install:"
+puts "   * Xcode Command Line Tools"
+puts "   * Homebrew"
+puts "   * Ansible"
+puts "   * Ansible Playbook #{ansible_playbook} from #{ansible_playbook_repository}"
+
+wait_for_user if STDIN.tty?
+
+# Xcode Command Line Tools
+
+ohai "Checking for Xcode Command Line Tools"
+if `/usr/bin/xcode-select -p 2>&1` =~ /error/
+  puts "Xcode Command Line Tools not found"
+  puts
+
+  ohai "Installing Xcode Command Line Tools"
+  print "Please click on 'install' in the next dialog box"
+  wait_for_user if STDIN.tty?
+  
+  sudo "/usr/bin/xcode-select", "--install"
+
+  # 1800s = 30 min.
+  wait_until_for(1800) { `/usr/bin/xcode-select -p 2>&1` !~ /error/ }
+  puts
+
+  abort "Xcode Command Line Tools could still not be found" if `/usr/bin/xcode-select -p 2>&1` =~ /error/
+  puts "Xcode Command Line Tools installed"
+else
+  puts "Xcode Command Line Tools found; will not be installed again"
+end
+puts
+
+# Xcode license
+
+ohai "Checking if Xcode license was agreed to"
+if `/usr/bin/xcrun clang 2>&1` =~ /license/ && !$?.success?
+  puts "You have not agreed to the Xcode license."
+  puts
+
+  ohai "The license will now be opened."
+  wait_for_user if STDIN.tty?
+  
+  sudo "/usr/bin/xcrun xcodebuild", "-license"
+
+  abort "The Xcode license has still not been agreed to." if `/usr/bin/xcrun clang 2>&1` =~ /license/ && !$?.success?
+else
+  puts "You have agreed to the Xcode license."
+end
+puts
+
+# Homebrew
+
+ohai "Checking for Homebrew"
+if `command -v brew` == ""
+  puts "Homebrew not found"
+  puts
+
+  ohai "Installing Homebrew"
+  system 'ruby -e "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install)"'
+else
+  puts "Homebrew found: will not be installed again"
+end
+puts
+
+ohai "Updating Homebrew index"
+system "brew update"
+puts
+
+ohai "Installing Ansible"
+system "brew install ansible"
+puts
+
+# Ansible Playbook
+
+ohai "Running #{ansible_playbook} from #{ansible_playbook_repository}"
+system "ansible-pull",
+       "-K",
+       "-i", "hosts",
+       "-U", ansible_playbook_repository,
+       ansible_playbook
